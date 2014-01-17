@@ -72,6 +72,11 @@ CHAIN_CONFIG = [
      "code3":"SC0", "address_version":"\x6f", "magic":"\xca\xfe\xba\xbe"},
     {"chain":"Worldcoin",
      "code3":"WDC", "address_version":"\x49", "magic":"\xfb\xc0\xb6\xdb"},
+    {"chain":"Digitalcoin",
+     "code3":"DGC", "address_version":"\x1e", "magic":"\xfb\xc0\xb6\xdb"},
+    {"chain":"DogeCoin",
+     "code3":"DOGE", "address_version":"\x1e", "magic":"\xc0\xc0\xc0\xc0"},
+    #使用那个山寨币，在没初始化之前，需要把其他山寨币先屏蔽，当生成了db文件后，才能以此类推，开启别的山寨币结算。
     #{"chain":"",
     # "code3":"", "address_version":"\x", "magic":""},
     ]
