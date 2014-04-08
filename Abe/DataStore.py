@@ -35,7 +35,7 @@ import util
 import logging
 import base58
 
-SCHEMA_VERSION = "Abe37"
+SCHEMA_VERSION = "Abe38"
 
 CONFIG_DEFAULTS = {
     "dbtype":             None,
@@ -58,12 +58,9 @@ CONFIG_DEFAULTS = {
 WORK_BITS = 304  # XXX more than necessary.
 
 CHAIN_CONFIG = [
-    {"chain":"Bitcoin",
-     "code3":"BTC", "address_version":"\x00", "magic":"\xf9\xbe\xb4\xd9"},
-    {"chain":"Testnet",
-     "code3":"BC0", "address_version":"\x6f", "magic":"\xfa\xbf\xb5\xda"},
-    {"chain":"Namecoin",
-     "code3":"NMC", "address_version":"\x34", "magic":"\xf9\xbe\xb4\xfe"},
+    {"chain":"Bitcoin"},
+    {"chain":"Testnet"},
+    {"chain":"Namecoin"},
     {"chain":"Weeds", "network":"Weedsnet",
      "code3":"WDS", "address_version":"\xf3", "magic":"\xf8\xbf\xb5\xda"},
     {"chain":"BeerTokens",
@@ -76,31 +73,19 @@ CHAIN_CONFIG = [
      "code3":"WDC", "address_version":"\x49", "magic":"\xfb\xc0\xb6\xdb"},
     {"chain":"NovaCoin"},
     {"chain":"CryptoCash"},
+    {"chain":"Anoncoin","code3":"ANC", "address_version":"\u0017", "magic":"\xFA\xCA\xBA\xDA" },
+    {"chain":"Hirocoin"},
     #{"chain":"",
     # "code3":"", "address_version":"\x", "magic":""},
     ]
 
-NULL_HASH = "\0" * 32
-GENESIS_HASH_PREV = NULL_HASH
-
-NULL_PUBKEY_HASH = "\0" * 20
+NULL_PUBKEY_HASH = "\0" * Chain.PUBKEY_HASH_LENGTH
 NULL_PUBKEY_ID = 0
 PUBKEY_ID_NETWORK_FEE = NULL_PUBKEY_ID
 
-# Regex to match a pubkey hash ("Bitcoin address transaction") in
-# txout_scriptPubKey.  Tolerate OP_NOP (0x61) at the end, seen in Bitcoin
-# 127630 and 128239.
-SCRIPT_ADDRESS_RE = re.compile("\x76\xa9\x14(.{20})\x88\xac\x61?\\Z", re.DOTALL)
-
-# Regex to match a pubkey ("IP address transaction") in txout_scriptPubKey.
-SCRIPT_PUBKEY_RE = re.compile(
-    ".((?<=\x41)(?:.{65})|(?<=\x21)(?:.{33}))\xac\\Z", re.DOTALL)
-
-# Script that can never be redeemed, used in Namecoin.
-SCRIPT_NETWORK_FEE = '\x6a'
-
-# Size of the script columns.
+# Size of the script and pubkey columns in bytes.
 MAX_SCRIPT = 1000000
+MAX_PUBKEY = 65
 
 NO_CLOB = 'BUG_NO_CLOB'
 
@@ -114,6 +99,12 @@ class MerkleRootMismatch(InvalidBlock):
     def __str__(ex):
         return 'Block header Merkle root does not match its transactions. ' \
             'block hash=%s' % (ex.block_hash[::-1].encode('hex'),)
+
+class MalformedHash(ValueError):
+    pass
+
+class MalformedAddress(ValueError):
+    pass
 
 class DataStore(object):
 
@@ -197,7 +188,7 @@ class DataStore(object):
             store.sql("UPDATE datadir SET blkfile_number=1, blkfile_offset=0")
 
         store._init_datadirs()
-        store._init_chains()
+        store.init_chains()
 
         store.commit_bytes = args.commit_bytes
         if store.commit_bytes is None:
@@ -209,7 +200,7 @@ class DataStore(object):
         store.use_firstbits = (store.config['use_firstbits'] == "true")
 
         for hex_tx in args.import_tx:
-            chain = None
+            chain_name = None
             if isinstance(hex_tx, dict):
                 chain_name = hex_tx.get("chain")
                 hex_tx = hex_tx.get("tx")
@@ -274,11 +265,11 @@ class DataStore(object):
         store.log.info("Reconnecting to database.")
         try:
             store.cursor.close()
-        except:
+        except Exception:
             pass
         try:
             store.conn.close()
-        except:
+        except Exception:
             pass
         store.init_conn()
 
@@ -297,7 +288,7 @@ class DataStore(object):
         except store.module.DatabaseError:
             try:
                 store.rollback()
-            except:
+            except Exception:
                 pass
 
         # Read legacy table CONFIG if it exists.
@@ -309,10 +300,10 @@ class DataStore(object):
             row = store.cursor.fetchone()
             sv, btype = row
             return { 'schema_version': sv, 'binary_type': btype }
-        except:
+        except Exception:
             try:
                 store.rollback()
-            except:
+            except Exception:
                 pass
 
         # Return None to indicate no schema found.
@@ -506,7 +497,7 @@ class DataStore(object):
 
             try:
                 store.reconnect()
-            except:
+            except Exception:
                 store.log.exception("Failed to reconnect")
                 raise e
 
@@ -609,7 +600,7 @@ class DataStore(object):
         try:
             max_varchar = int(store.config['max_varchar'])
             clob_type = store.config['clob_type']
-        except:
+        except Exception:
             return stmt
 
         patt = re.compile("VARCHAR\\(([0-9]+)\\)")
@@ -735,6 +726,12 @@ class DataStore(object):
                         elif isinstance(addr_vers, unicode):
                             addr_vers = addr_vers.encode('latin_1')
 
+                        script_addr_vers = dircfg.get('script_addr_vers')
+                        if script_addr_vers is None:
+                            script_addr_vers = "\x05"
+                        elif isinstance(script_addr_vers, unicode):
+                            script_addr_vers = script_addr_vers.encode('latin_1')
+
                         decimals = dircfg.get('decimals')
                         if decimals is not None:
                             decimals = int(decimals)
@@ -745,11 +742,11 @@ class DataStore(object):
                         store.sql("""
                             INSERT INTO chain (
                                 chain_id, chain_name, chain_code3,
-                                chain_address_version, chain_policy,
+                                chain_address_version, chain_script_addr_vers, chain_policy,
                                 chain_decimals
-                            ) VALUES (?, ?, ?, ?, ?, ?)""",
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                                   (chain_id, chain_name, code3,
-                                   store.binin(addr_vers),
+                                   store.binin(addr_vers), store.binin(script_addr_vers),
                                    dircfg.get('policy', chain_name), decimals))
                         store.commit()
                         store.log.warning("Assigned chain_id %d to %s",
@@ -775,7 +772,7 @@ class DataStore(object):
                 }
             store.datadirs.append(d)
 
-    def _init_chains(store):
+    def init_chains(store):
         store.chains_by = lambda: 0
         store.chains_by.id = {}
         store.chains_by.name = {}
@@ -786,11 +783,11 @@ class DataStore(object):
         if isinstance(no_bit8_chains, str):
             no_bit8_chains = [no_bit8_chains]
 
-        for chain_id, magic, chain_name, chain_code3, address_version, \
+        for chain_id, magic, chain_name, chain_code3, address_version, script_addr_vers, \
                 chain_policy, chain_decimals in \
                 store.selectall("""
                     SELECT chain_id, chain_magic, chain_name, chain_code3,
-                           chain_address_version, chain_policy, chain_decimals
+                           chain_address_version, chain_script_addr_vers, chain_policy, chain_decimals
                       FROM chain
                 """):
             chain = Chain.create(
@@ -799,6 +796,7 @@ class DataStore(object):
                 name            = unicode(chain_name),
                 code3           = chain_code3 and unicode(chain_code3),
                 address_version = store.binout(address_version),
+                script_addr_vers = store.binout(script_addr_vers),
                 policy          = unicode(chain_policy),
                 decimals        = None if chain_decimals is None else \
                     int(chain_decimals))
@@ -813,10 +811,14 @@ class DataStore(object):
             store.chains_by.magic[chain.magic] = chain
 
     def get_chain_by_id(store, chain_id):
-        return store.chains_by.id[chain_id]
+        return store.chains_by.id[int(chain_id)]
 
     def get_chain_by_name(store, name):
         return store.chains_by.name.get(name, None)
+
+    def get_default_chain(store):
+        store.log.debug("Falling back to default (Bitcoin) policy.")
+        return Chain.create(None)
 
     def _new_id_update(store, key):
         """
@@ -852,7 +854,7 @@ class DataStore(object):
             store.rollback()
             try:
                 store.ddl(store._ddl['abe_sequences'])
-            except:
+            except Exception:
                 store.rollback()
                 raise e
             store.sql("INSERT INTO abe_sequences (sequence_key, nextid)"
@@ -1017,6 +1019,7 @@ LEFT JOIN block prev ON (b.prev_block_id = prev.block_id)""",
     NULL txin_scriptSig,
     NULL txin_sequence""") + """,
     prevout.txout_value txin_value,
+    prevout.txout_scriptPubKey txin_scriptPubKey,
     pubkey.pubkey_id,
     pubkey.pubkey_hash,
     pubkey.pubkey
@@ -1106,8 +1109,9 @@ store._ddl['configvar'],
 """CREATE TABLE chain (
     chain_id    NUMERIC(10) NOT NULL PRIMARY KEY,
     chain_name  VARCHAR(100) UNIQUE NOT NULL,
-    chain_code3 CHAR(3)     NULL,
+    chain_code3 VARCHAR(4)     NULL,
     chain_address_version BIT VARYING(800) NOT NULL,
+    chain_script_addr_vers BIT VARYING(800) NULL,
     chain_magic BIT(32)     NULL,
     chain_policy VARCHAR(255) NOT NULL,
     chain_decimals NUMERIC(2) NULL,
@@ -1178,8 +1182,17 @@ store._ddl['configvar'],
 """CREATE TABLE pubkey (
     pubkey_id     NUMERIC(26) NOT NULL PRIMARY KEY,
     pubkey_hash   BIT(160)    UNIQUE NOT NULL,
-    pubkey        BIT(520)    NULL
+   pubkey        BIT(""" + str(8 * MAX_PUBKEY) + """)    NULL
 )""",
+
+"""CREATE TABLE multisig_pubkey (
+    multisig_id   NUMERIC(26) NOT NULL,
+    pubkey_id     NUMERIC(26) NOT NULL,
+    PRIMARY KEY (multisig_id, pubkey_id),
+    FOREIGN KEY (multisig_id) REFERENCES pubkey (pubkey_id),
+    FOREIGN KEY (pubkey_id) REFERENCES pubkey (pubkey_id)
+)""",
+"""CREATE INDEX x_multisig_pubkey_pubkey ON multisig_pubkey (pubkey_id)""",
 
 # A transaction out-point.
 """CREATE TABLE txout (
@@ -1242,7 +1255,7 @@ store._ddl['txout_approx'],
 ):
             try:
                 store.ddl(stmt)
-            except:
+            except Exception:
                 store.log.error("Failed: %s", stmt)
                 raise
 
@@ -1293,10 +1306,10 @@ store._ddl['txout_approx'],
         store.sql("""
             INSERT INTO chain (
                 chain_id, chain_magic, chain_name, chain_code3,
-                chain_address_version, chain_policy, chain_decimals
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                chain_address_version, chain_script_addr_vers, chain_policy, chain_decimals
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                   (chain.id, store.binin(chain.magic), chain.name,
-                   chain.code3, store.binin(chain.address_version),
+                   chain.code3, store.binin(chain.address_version), store.binin(chain.script_addr_vers),
                    chain.name, chain.decimals))
 
     def get_lock(store):
@@ -1319,7 +1332,7 @@ store._ddl['txout_approx'],
                 INSERT INTO configvar (configvar_name, configvar_value)
                 VALUES (?, ?)""",
                       ("upgrade-lock-" + letters, 'x'))
-        except:
+        except Exception:
             store.release_lock(conn)
             conn = None
 
@@ -1335,9 +1348,12 @@ store._ddl['txout_approx'],
             conn.close()
 
     def version_below(store, vers):
-        sv = store.config['schema_version'].replace('Abe', '')
-        vers = vers.replace('Abe', '')
-        return float(sv) < float(vers)
+        try:
+            sv = float(store.config['schema_version'].replace('Abe', ''))
+        except ValueError:
+            return False
+        vers = float(vers.replace('Abe', ''))
+        return sv < vers
 
     def configure(store):
         store.config = {}
@@ -1528,7 +1544,7 @@ store._ddl['txout_approx'],
             except Exception, e:
                 try:
                     store.rollback()
-                except:
+                except Exception:
                     # Fetching a CLOB really messes up Easysoft ODBC Oracle.
                     store.reconnect()
             finally:
@@ -1782,9 +1798,9 @@ store._ddl['txout_approx'],
                 all_txins_linked = False
             else:
                 if store.commit_bytes == 0:
-                    tx['tx_id'] = store.import_and_commit_tx(tx, pos == 0)
+                    tx['tx_id'] = store.import_and_commit_tx(tx, pos == 0, chain)
                 else:
-                    tx['tx_id'] = store.import_tx(tx, pos == 0)
+                    tx['tx_id'] = store.import_tx(tx, pos == 0, chain)
                 if tx.get('unlinked_count', 1) > 0:
                     all_txins_linked = False
 
@@ -1799,13 +1815,19 @@ store._ddl['txout_approx'],
         block_id = int(store.new_id("block"))
         b['block_id'] = block_id
 
-        # Verify Merkle root.
-        if b['hashMerkleRoot'] != util.merkle(tx_hash_array):
-            raise MerkleRootMismatch(b['hash'], tx_hash_array)
+        if chain is not None:
+            # Verify Merkle root.
+            if b['hashMerkleRoot'] != chain.merkle_root(tx_hash_array):
+                raise MerkleRootMismatch(b['hash'], tx_hash_array)
 
         # Look for the parent block.
         hashPrev = b['hashPrev']
-        is_genesis = hashPrev == GENESIS_HASH_PREV
+        if chain is None:
+            # XXX No longer used.
+            is_genesis = hashPrev == util.GENESIS_HASH_PREV
+        else:
+            is_genesis = hashPrev == chain.genesis_hash_prev
+
         (prev_block_id, prev_height, prev_work, prev_satoshis,
          prev_seconds, prev_ss, prev_total_ss, prev_nTime) = (
             (None, -1, 0, 0, 0, 0, 0, b['nTime'])
@@ -2189,6 +2211,287 @@ store._ddl['txout_approx'],
             if pair and pair[1] > ret[chain_id][1]:
                 ret[chain_id] = pair
 
+    def _export_scriptPubKey(store, txout, chain, scriptPubKey):
+        """In txout, set script_type, address_version, binaddr, and for multisig, required_signatures."""
+
+        if scriptPubKey is None:
+            txout['script_type'] = None
+            txout['binaddr'] = None
+            return
+
+        script_type, data = chain.parse_txout_script(scriptPubKey)
+        txout['script_type'] = script_type
+        txout['address_version'] = chain.address_version
+
+        if script_type == Chain.SCRIPT_TYPE_PUBKEY:
+            txout['binaddr'] = chain.pubkey_hash(data)
+        elif script_type == Chain.SCRIPT_TYPE_ADDRESS:
+            txout['binaddr'] = data
+        elif script_type == Chain.SCRIPT_TYPE_P2SH:
+            txout['address_version'] = chain.script_addr_vers
+            txout['binaddr'] = data
+        elif script_type == Chain.SCRIPT_TYPE_MULTISIG:
+            txout['required_signatures'] = data['m']
+            txout['binaddr'] = chain.pubkey_hash(scriptPubKey)
+            txout['subbinaddr'] = [
+                chain.pubkey_hash(pubkey)
+                for pubkey in data['pubkeys']
+                ]
+        elif script_type == Chain.SCRIPT_TYPE_BURN:
+            txout['binaddr'] = NULL_PUBKEY_HASH
+        else:
+            txout['binaddr'] = None
+
+    def export_block(store, chain=None, block_hash=None, block_number=None):
+        """
+        Return a dict with the following:
+
+        * chain_candidates[]
+            * chain
+            * in_longest
+        * chain_satoshis
+        * chain_satoshi_seconds
+        * chain_work
+        * fees
+        * generated
+        * hash
+        * hashMerkleRoot
+        * hashPrev
+        * height
+        * nBits
+        * next_block_hashes
+        * nNonce
+        * nTime
+        * satoshis_destroyed
+        * satoshi_seconds
+        * transactions[]
+            * fees
+            * hash
+            * in[]
+                * address_version
+                * binaddr
+                * value
+            * out[]
+                * address_version
+                * binaddr
+                * value
+            * size
+        * value_out
+        * version
+
+        Additionally, for multisig inputs and outputs:
+
+        * subbinaddr[]
+        * required_signatures
+
+        Additionally, for proof-of-stake chains:
+
+        * is_proof_of_stake
+        * proof_of_stake_generated
+        """
+
+        if block_number is None and block_hash is None:
+            raise ValueError("export_block requires either block_hash or block_number")
+
+        where = []
+        bind = []
+
+        if chain is not None:
+            where.append('chain_id = ?')
+            bind.append(chain.id)
+
+        if block_hash is not None:
+            where.append('block_hash = ?')
+            bind.append(store.hashin_hex(block_hash))
+
+        if block_number is not None:
+            where.append('block_height = ? AND in_longest = 1')
+            bind.append(block_number)
+
+        sql = """
+            SELECT
+                chain_id,
+                in_longest,
+                block_id,
+                block_hash,
+                block_version,
+                block_hashMerkleRoot,
+                block_nTime,
+                block_nBits,
+                block_nNonce,
+                block_height,
+                prev_block_hash,
+                block_chain_work,
+                block_value_in,
+                block_value_out,
+                block_total_satoshis,
+                block_total_seconds,
+                block_satoshi_seconds,
+                block_total_ss,
+                block_ss_destroyed,
+                block_num_tx
+              FROM chain_summary
+             WHERE """ + ' AND '.join(where) + """
+             ORDER BY
+                in_longest DESC,
+                chain_id DESC"""
+        rows = store.selectall(sql, bind)
+
+        if len(rows) == 0:
+            return None
+
+        row = rows[0][2:]
+        def parse_cc(row):
+            chain_id, in_longest = row[:2]
+            return { "chain": store.get_chain_by_id(chain_id), "in_longest": in_longest }
+
+        # Absent the chain argument, default to highest chain_id, preferring to avoid side chains.
+        cc = map(parse_cc, rows)
+
+        # "chain" may be None, but "found_chain" will not.
+        found_chain = chain
+        if found_chain is None:
+            if len(cc) > 0:
+                found_chain = cc[0]['chain']
+            else:
+                # Should not normally get here.
+                found_chain = store.get_default_chain()
+
+        (block_id, block_hash, block_version, hashMerkleRoot,
+         nTime, nBits, nNonce, height,
+         prev_block_hash, block_chain_work, value_in, value_out,
+         satoshis, seconds, ss, total_ss, destroyed, num_tx) = (
+            row[0], store.hashout_hex(row[1]), row[2],
+            store.hashout_hex(row[3]), row[4], int(row[5]), row[6],
+            row[7], store.hashout_hex(row[8]),
+            store.binout_int(row[9]), int(row[10]), int(row[11]),
+            None if row[12] is None else int(row[12]),
+            None if row[13] is None else int(row[13]),
+            None if row[14] is None else int(row[14]),
+            None if row[15] is None else int(row[15]),
+            None if row[16] is None else int(row[16]),
+            int(row[17]),
+            )
+
+        next_hashes = [
+            store.hashout_hex(hash) for hash, il in
+            store.selectall("""
+            SELECT DISTINCT n.block_hash, cc.in_longest
+              FROM block_next bn
+              JOIN block n ON (bn.next_block_id = n.block_id)
+              JOIN chain_candidate cc ON (n.block_id = cc.block_id)
+             WHERE bn.block_id = ?
+             ORDER BY cc.in_longest DESC""",
+                            (block_id,)) ]
+
+        tx_ids = []
+        txs = {}
+        block_out = 0
+        block_in = 0
+
+        for row in store.selectall("""
+            SELECT tx_id, tx_hash, tx_size, txout_value, txout_scriptPubKey
+              FROM txout_detail
+             WHERE block_id = ?
+             ORDER BY tx_pos, txout_pos
+        """, (block_id,)):
+            tx_id, tx_hash, tx_size, txout_value, scriptPubKey = (
+                row[0], row[1], row[2], int(row[3]), store.binout(row[4]))
+            tx = txs.get(tx_id)
+            if tx is None:
+                tx_ids.append(tx_id)
+                txs[tx_id] = {
+                    "hash": store.hashout_hex(tx_hash),
+                    "total_out": 0,
+                    "total_in": 0,
+                    "out": [],
+                    "in": [],
+                    "size": int(tx_size),
+                    }
+                tx = txs[tx_id]
+            tx['total_out'] += txout_value
+            block_out += txout_value
+
+            txout = { 'value': txout_value }
+            store._export_scriptPubKey(txout, found_chain, scriptPubKey)
+            tx['out'].append(txout)
+
+        for row in store.selectall("""
+            SELECT tx_id, txin_value, txin_scriptPubKey
+              FROM txin_detail
+             WHERE block_id = ?
+             ORDER BY tx_pos, txin_pos
+        """, (block_id,)):
+            tx_id, txin_value, scriptPubKey = (
+                row[0], 0 if row[1] is None else int(row[1]),
+                store.binout(row[2]))
+            tx = txs.get(tx_id)
+            if tx is None:
+                # Strange, inputs but no outputs?
+                tx_ids.append(tx_id)
+                tx_hash, tx_size = store.selectrow("""
+                    SELECT tx_hash, tx_size FROM tx WHERE tx_id = ?""",
+                                           (tx_id,))
+                txs[tx_id] = {
+                    "hash": store.hashout_hex(tx_hash),
+                    "total_out": 0,
+                    "total_in": 0,
+                    "out": [],
+                    "in": [],
+                    "size": int(tx_size),
+                    }
+                tx = txs[tx_id]
+            tx['total_in'] += txin_value
+            block_in += txin_value
+
+            txin = { 'value': txin_value }
+            store._export_scriptPubKey(txin, found_chain, scriptPubKey)
+            tx['in'].append(txin)
+
+        generated = block_out - block_in
+        coinbase_tx = txs[tx_ids[0]]
+        coinbase_tx['fees'] = 0
+        block_fees = coinbase_tx['total_out'] - generated
+
+        b = {
+            'chain_candidates':      cc,
+            'chain_satoshis':        satoshis,
+            'chain_satoshi_seconds': total_ss,
+            'chain_work':            block_chain_work,
+            'fees':                  block_fees,
+            'generated':             generated,
+            'hash':                  block_hash,
+            'hashMerkleRoot':        hashMerkleRoot,
+            'hashPrev':              prev_block_hash,
+            'height':                height,
+            'nBits':                 nBits,
+            'next_block_hashes':     next_hashes,
+            'nNonce':                nNonce,
+            'nTime':                 nTime,
+            'satoshis_destroyed':    destroyed,
+            'satoshi_seconds':       ss,
+            'transactions':          [txs[tx_id] for tx_id in tx_ids],
+            'value_out':             block_out,
+            'version':               block_version,
+            }
+
+        is_stake_chain = chain is not None and chain.has_feature('nvc_proof_of_stake')
+        if is_stake_chain:
+            # Proof-of-stake display based loosely on CryptoManiac/novacoin and
+            # http://nvc.cryptocoinexplorer.com.
+            b['is_proof_of_stake'] = len(tx_ids) > 1 and coinbase_tx['total_out'] == 0
+
+        for tx_id in tx_ids[1:]:
+            tx = txs[tx_id]
+            tx['fees'] = tx['total_in'] - tx['total_out']
+
+        if is_stake_chain and b['is_proof_of_stake']:
+            b['proof_of_stake_generated'] = -txs[tx_ids[1]]['fees']
+            txs[tx_ids[1]]['fees'] = 0
+            b['fees'] += b['proof_of_stake_generated']
+
+        return b
+
     def tx_find_id_and_value(store, tx, is_coinbase):
         row = store.selectrow("""
             SELECT tx.tx_id, SUM(txout.txout_value), SUM(
@@ -2217,7 +2520,7 @@ store._ddl['txout_approx'],
 
         return None
 
-    def import_tx(store, tx, is_coinbase):
+    def import_tx(store, tx, is_coinbase, chain):
         tx_id = store.new_id("tx")
         dbhash = store.hashin(tx['hash'])
 
@@ -2238,7 +2541,7 @@ store._ddl['txout_approx'],
             tx['value_out'] += txout['value']
             txout_id = store.new_id("txout")
 
-            pubkey_id = store.script_to_pubkey_id(txout['scriptPubKey'])
+            pubkey_id = store.script_to_pubkey_id(chain, txout['scriptPubKey'])
             if pubkey_id is not None and pubkey_id <= 0:
                 tx['value_destroyed'] += txout['value']
 
@@ -2302,9 +2605,9 @@ store._ddl['txout_approx'],
         # requires them.
         return tx_id
 
-    def import_and_commit_tx(store, tx, is_coinbase):
+    def import_and_commit_tx(store, tx, is_coinbase, chain):
         try:
-            tx_id = store.import_tx(tx, is_coinbase)
+            tx_id = store.import_tx(tx, is_coinbase, chain)
             store.commit()
 
         except store.module.DatabaseError:
@@ -2318,9 +2621,9 @@ store._ddl['txout_approx'],
 
     def maybe_import_binary_tx(store, chain_name, binary_tx):
         if chain_name is None:
-            chain = Chain.create(None)  # default to BTC tx format
+            chain = store.get_default_chain()
         else:
-            chain = store.chains_by.name(chain_name)
+            chain = store.get_chain_by_name(chain_name)
 
         tx_hash = chain.transaction_hash(binary_tx)
 
@@ -2331,11 +2634,15 @@ store._ddl['txout_approx'],
         if count == 0:
             tx = chain.parse_transaction(binary_tx)
             tx['hash'] = tx_hash
-            store.import_tx(tx, util.is_coinbase_tx(tx))
+            store.import_tx(tx, chain.is_coinbase_tx(tx), chain)
             store.imported_bytes(tx['size'])
 
-    def export_tx(store, tx_id=None, tx_hash=None, decimals=8, format="api"):
+    def export_tx(store, tx_id=None, tx_hash=None, decimals=8, format="api", chain=None):
         """Return a dict as seen by /rawtx or None if not found."""
+
+        # TODO: merge _export_tx_detail with export_tx.
+        if format == 'browser':
+            return store._export_tx_detail(tx_hash, chain=chain)
 
         tx = {}
         is_bin = format == "binary"
@@ -2436,6 +2743,281 @@ store._ddl['txout_approx'],
 
         return tx
 
+    def _export_tx_detail(store, tx_hash, chain):
+        try:
+            dbhash = store.hashin_hex(tx_hash)
+        except TypeError:
+            raise MalformedHash()
+
+        row = store.selectrow("""
+            SELECT tx_id, tx_version, tx_lockTime, tx_size
+              FROM tx
+             WHERE tx_hash = ?
+        """, (dbhash,))
+        if row is None:
+            return None
+
+        tx_id = int(row[0])
+        tx = {
+            'hash': tx_hash,
+            'version': int(row[1]),
+            'lockTime': int(row[2]),
+            'size': int(row[3]),
+            }
+
+        def parse_tx_cc(row):
+            return {
+                'chain': store.get_chain_by_id(row[0]),
+                'in_longest': int(row[1]),
+                'block_nTime': int(row[2]),
+                'block_height': None if row[3] is None else int(row[3]),
+                'block_hash': store.hashout_hex(row[4]),
+                'tx_pos': int(row[5])
+                }
+
+        tx['chain_candidates'] = map(parse_tx_cc, store.selectall("""
+            SELECT cc.chain_id, cc.in_longest,
+                   b.block_nTime, b.block_height, b.block_hash,
+                   block_tx.tx_pos
+              FROM chain_candidate cc
+              JOIN block b ON (b.block_id = cc.block_id)
+              JOIN block_tx ON (block_tx.block_id = b.block_id)
+             WHERE block_tx.tx_id = ?
+             ORDER BY cc.chain_id, cc.in_longest DESC, b.block_hash
+        """, (tx_id,)))
+
+        if chain is None:
+            if len(tx['chain_candidates']) > 0:
+                chain = tx['chain_candidates'][0]['chain']
+            else:
+                chain = store.get_default_chain()
+
+        def parse_row(row):
+            pos, script, value, o_hash, o_pos = row[:5]
+            script = store.binout(script)
+            scriptPubKey = store.binout(row[5]) if len(row) >5 else script
+
+            ret = {
+                "pos": int(pos),
+                "binscript": script,
+                "value": None if value is None else int(value),
+                "o_hash": store.hashout_hex(o_hash),
+                "o_pos": None if o_pos is None else int(o_pos),
+                }
+            store._export_scriptPubKey(ret, chain, scriptPubKey)
+
+            return ret
+
+        # XXX Unneeded outer join.
+        tx['in'] = map(parse_row, store.selectall("""
+            SELECT
+                txin.txin_pos""" + (""",
+                txin.txin_scriptSig""" if store.keep_scriptsig else """,
+                NULL""") + """,
+                txout.txout_value,
+                COALESCE(prevtx.tx_hash, u.txout_tx_hash),
+                COALESCE(txout.txout_pos, u.txout_pos),
+                txout.txout_scriptPubKey
+              FROM txin
+              LEFT JOIN txout ON (txout.txout_id = txin.txout_id)
+              LEFT JOIN tx prevtx ON (txout.tx_id = prevtx.tx_id)
+              LEFT JOIN unlinked_txin u ON (u.txin_id = txin.txin_id)
+             WHERE txin.tx_id = ?
+             ORDER BY txin.txin_pos
+        """, (tx_id,)))
+
+        # XXX Only one outer join needed.
+        tx['out'] = map(parse_row, store.selectall("""
+            SELECT
+                txout.txout_pos,
+                txout.txout_scriptPubKey,
+                txout.txout_value,
+                nexttx.tx_hash,
+                txin.txin_pos
+              FROM txout
+              LEFT JOIN txin ON (txin.txout_id = txout.txout_id)
+              LEFT JOIN tx nexttx ON (txin.tx_id = nexttx.tx_id)
+             WHERE txout.tx_id = ?
+             ORDER BY txout.txout_pos
+        """, (tx_id,)))
+
+        def sum_values(rows):
+            ret = 0
+            for row in rows:
+                if row['value'] is None:
+                    return None
+                ret += row['value']
+            return ret
+
+        tx['value_in'] = sum_values(tx['in'])
+        tx['value_out'] = sum_values(tx['out'])
+
+        return tx
+
+    def export_address_history(store, address, chain=None, max_rows=-1, types=frozenset(['direct', 'escrow'])):
+        version, binaddr = util.decode_check_address(address)
+        if binaddr is None:
+            raise MalformedAddress("Invalid address")
+
+        balance = {}
+        received = {}
+        sent = {}
+        counts = [0, 0]
+        chains = []
+
+        def adj_balance(txpoint):
+            chain = txpoint['chain']
+
+            if chain.id not in balance:
+                chains.append(chain)
+                balance[chain.id] = 0
+                received[chain.id] = 0
+                sent[chain.id] = 0
+
+            if txpoint['type'] == 'direct':
+                value = txpoint['value']
+                balance[chain.id] += value
+                if txpoint['is_out']:
+                    sent[chain.id] -= value
+                else:
+                    received[chain.id] += value
+                counts[txpoint['is_out']] += 1
+
+        dbhash = store.binin(binaddr)
+        txpoints = []
+
+        def parse_row(is_out, row_type, nTime, chain_id, height, blk_hash, tx_hash, pos, value, script=None):
+            chain = store.get_chain_by_id(chain_id)
+            txpoint = {
+                'type':     row_type,
+                'is_out':   int(is_out),
+                'nTime':    int(nTime),
+                'chain':    chain,
+                'height':   int(height),
+                'blk_hash': store.hashout_hex(blk_hash),
+                'tx_hash':  store.hashout_hex(tx_hash),
+                'pos':      int(pos),
+                'value':    int(value),
+                }
+            if script is not None:
+                store._export_scriptPubKey(txpoint, chain, store.binout(script))
+
+            return txpoint
+
+        def parse_direct_in(row):  return parse_row(True, 'direct', *row)
+        def parse_direct_out(row): return parse_row(False, 'direct', *row)
+        def parse_escrow_in(row):  return parse_row(True, 'escrow', *row)
+        def parse_escrow_out(row): return parse_row(False, 'escrow', *row)
+
+        def get_received(escrow):
+            return store.selectall("""
+                SELECT
+                    b.block_nTime,
+                    cc.chain_id,
+                    b.block_height,
+                    b.block_hash,
+                    tx.tx_hash,
+                    txin.txin_pos,
+                    -prevout.txout_value""" + (""",
+                    prevout.txout_scriptPubKey""" if escrow else "") + """
+                  FROM chain_candidate cc
+                  JOIN block b ON (b.block_id = cc.block_id)
+                  JOIN block_tx ON (block_tx.block_id = b.block_id)
+                  JOIN tx ON (tx.tx_id = block_tx.tx_id)
+                  JOIN txin ON (txin.tx_id = tx.tx_id)
+                  JOIN txout prevout ON (txin.txout_id = prevout.txout_id)""" + ("""
+                  JOIN multisig_pubkey mp ON (mp.multisig_id = prevout.pubkey_id)""" if escrow else "") + """
+                  JOIN pubkey ON (pubkey.pubkey_id = """ + ("mp" if escrow else "prevout") + """.pubkey_id)
+                 WHERE pubkey.pubkey_hash = ?
+                   AND cc.in_longest = 1""" + ("" if max_rows < 0 else """
+                 LIMIT ?"""),
+                          (dbhash,)
+                          if max_rows < 0 else
+                          (dbhash, max_rows + 1))
+
+        def get_sent(escrow):
+            return store.selectall("""
+                SELECT
+                    b.block_nTime,
+                    cc.chain_id,
+                    b.block_height,
+                    b.block_hash,
+                    tx.tx_hash,
+                    txout.txout_pos,
+                    txout.txout_value""" + (""",
+                    txout.txout_scriptPubKey""" if escrow else "") + """
+                  FROM chain_candidate cc
+                  JOIN block b ON (b.block_id = cc.block_id)
+                  JOIN block_tx ON (block_tx.block_id = b.block_id)
+                  JOIN tx ON (tx.tx_id = block_tx.tx_id)
+                  JOIN txout ON (txout.tx_id = tx.tx_id)""" + ("""
+                  JOIN multisig_pubkey mp ON (mp.multisig_id = txout.pubkey_id)""" if escrow else "") + """
+                  JOIN pubkey ON (pubkey.pubkey_id = """ + ("mp" if escrow else "txout") + """.pubkey_id)
+                 WHERE pubkey.pubkey_hash = ?
+                   AND cc.in_longest = 1""" + ("" if max_rows < 0 else """
+                 LIMIT ?"""),
+                          (dbhash, max_rows + 1)
+                          if max_rows >= 0 else
+                          (dbhash,))
+
+        if 'direct' in types:
+            in_rows = get_received(False)
+            if len(in_rows) > max_rows >= 0:
+                return None  # XXX Could still show address basic data.
+            txpoints += map(parse_direct_in, in_rows)
+
+            out_rows = get_sent(False)
+            if len(out_rows) > max_rows >= 0:
+                return None
+            txpoints += map(parse_direct_out, out_rows)
+
+        if 'escrow' in types:
+            in_rows = get_received(True)
+            if len(in_rows) > max_rows >= 0:
+                return None
+            txpoints += map(parse_escrow_in, in_rows)
+
+            out_rows = get_sent(True)
+            if len(out_rows) > max_rows >= 0:
+                return None
+            txpoints += map(parse_escrow_out, out_rows)
+
+        def cmp_txpoint(p1, p2):
+            return cmp(p1['nTime'], p2['nTime']) \
+                or cmp(p1['is_out'], p2['is_out']) \
+                or cmp(p1['height'], p2['height']) \
+                or cmp(p1['chain'].name, p2['chain'].name)
+
+        txpoints.sort(cmp_txpoint)
+
+        for txpoint in txpoints:
+            adj_balance(txpoint)
+
+        hist = {
+            'binaddr':  binaddr,
+            'version':  version,
+            'chains':   chains,
+            'txpoints': txpoints,
+            'balance':  balance,
+            'sent':     sent,
+            'received': received,
+            'counts':   counts
+            }
+
+        # Show P2SH address components, if known.
+        # XXX With some more work, we could find required_signatures.
+        for (subbinaddr,) in store.selectall("""
+            SELECT sub.pubkey_hash
+              FROM multisig_pubkey mp
+              JOIN pubkey top ON (mp.multisig_id = top.pubkey_id)
+              JOIN pubkey sub ON (mp.pubkey_id = sub.pubkey_id)
+             WHERE top.pubkey_hash = ?""", (dbhash,)):
+            if 'subbinaddr' not in hist:
+                hist['subbinaddr'] = []
+            hist['subbinaddr'].append(store.binout(subbinaddr))
+
+        return hist
+
     # Called to indicate that the given block has the correct magic
     # number and policy for the given chains.  Updates CHAIN_CANDIDATE
     # and CHAIN.CHAIN_LAST_BLOCK_ID as appropriate.
@@ -2492,7 +3074,7 @@ store._ddl['txout_approx'],
                 for block_id in to_connect:
                     store.connect_block(block_id, chain_id)
 
-            elif b['hashPrev'] == GENESIS_HASH_PREV:
+            elif b['hashPrev'] == store.get_chain_by_id(chain_id).genesis_hash_prev:
                 in_longest = 1  # Assume only one genesis block per chain.  XXX
             else:
                 in_longest = 0
@@ -2555,7 +3137,7 @@ store._ddl['txout_approx'],
                            b['block_id'], chain_id)
         else:
             if b['height'] == 0:
-                b['hashPrev'] = GENESIS_HASH_PREV
+                b['hashPrev'] = store.get_chain_by_id(chain_id).genesis_hash_prev
             else:
                 b['hashPrev'] = 'dummy'  # Fool adopt_orphans.
             store.offer_block_to_chains(b, frozenset([chain_id]))
@@ -2607,49 +3189,38 @@ store._ddl['txout_approx'],
                   (store.hashin(tx_hash), txout_pos))
         return (None, None) if row is None else (row[0], int(row[1]))
 
-    def script_to_pubkey_id(store, script):
-        """Extract address from transaction output script."""
-        if script == SCRIPT_NETWORK_FEE:
-            return PUBKEY_ID_NETWORK_FEE
-        match = SCRIPT_ADDRESS_RE.match(script)
-        if match:
-            return store.pubkey_hash_to_id(match.group(1))
-        match = SCRIPT_PUBKEY_RE.match(script)
-        if match:
-            return store.pubkey_to_id(match.group(1))
+    def script_to_pubkey_id(store, chain, script):
+        """Extract address and script type from transaction output script."""
+        script_type, data = chain.parse_txout_script(script)
 
-        # Not a standard Bitcoin script as of 2011-08-23.  Namecoin operation?
-        # Ignore leading pushes, pops, and nops so long as stack does not
-        # underflow and ends up empty.
-        opcodes = deserialize.opcodes
-        drops = (opcodes.OP_NOP, opcodes.OP_DROP, opcodes.OP_2DROP)
-        start = 0
-        sp = 0
-        for opcode, data, i in deserialize.script_GetOp(script):
-            if data is not None or \
-                    opcode == opcodes.OP_0 or \
-                    opcode == opcodes.OP_1NEGATE or \
-                    (opcode >= opcodes.OP_1 and opcode <= opcodes.OP_16):
-                sp += 1
-                continue
-            if opcode in drops:
-                to_drop = drops.index(opcode)
-                if sp < to_drop:
-                    break
-                sp -= to_drop
-                start = i
-                continue
-            if sp != 0 or start == 0:
-                break
-            return store.script_to_pubkey_id(script[start:])
+        if script_type in (Chain.SCRIPT_TYPE_ADDRESS, Chain.SCRIPT_TYPE_P2SH):
+            return store.pubkey_hash_to_id(data)
+
+        if script_type == Chain.SCRIPT_TYPE_PUBKEY:
+            return store.pubkey_to_id(chain, data)
+
+        if script_type == Chain.SCRIPT_TYPE_MULTISIG:
+            script_hash = chain.script_hash(script)
+            multisig_id = store._pubkey_id(script_hash, script)
+
+            if not store.selectrow("SELECT 1 FROM multisig_pubkey WHERE multisig_id = ?", (multisig_id,)):
+                for pubkey in set(data['pubkeys']):
+                    pubkey_id = store.pubkey_to_id(chain, pubkey)
+                    store.sql("""
+                        INSERT INTO multisig_pubkey (multisig_id, pubkey_id)
+                        VALUES (?, ?)""", (multisig_id, pubkey_id))
+            return multisig_id
+
+        if script_type == Chain.SCRIPT_TYPE_BURN:
+            return PUBKEY_ID_NETWORK_FEE
 
         return None
 
     def pubkey_hash_to_id(store, pubkey_hash):
         return store._pubkey_id(pubkey_hash, None)
 
-    def pubkey_to_id(store, pubkey):
-        pubkey_hash = util.pubkey_to_hash(pubkey)
+    def pubkey_to_id(store, chain, pubkey):
+        pubkey_hash = chain.pubkey_hash(pubkey)
         return store._pubkey_id(pubkey_hash, pubkey)
 
     def _pubkey_id(store, pubkey_hash, pubkey):
@@ -2661,6 +3232,10 @@ store._ddl['txout_approx'],
         if row:
             return row[0]
         pubkey_id = store.new_id("pubkey")
+
+        if pubkey is not None and len(pubkey) > MAX_PUBKEY:
+            pubkey = None
+
         store.sql("""
             INSERT INTO pubkey (pubkey_id, pubkey_hash, pubkey)
             VALUES (?, ?, ?)""",
@@ -2712,7 +3287,7 @@ store._ddl['txout_approx'],
             return False
         chain = store.chains_by.id[chain_id]
 
-        conffile = dircfg['conf'] or chain.datadir_conf_file_name
+        conffile = dircfg.get('conf') or chain.datadir_conf_file_name
         conffile = os.path.join(dircfg['dirname'], conffile)
         try:
             conf = dict([line.strip().split("=", 1)
@@ -2828,7 +3403,7 @@ store._ddl['txout_approx'],
                     prev_hash = \
                         rpc_block['previousblockhash'].decode('hex')[::-1] \
                         if 'previousblockhash' in rpc_block \
-                        else GENESIS_HASH_PREV
+                        else chain.genesis_hash_prev
 
                     block = {
                         'hash':     hash,
@@ -2873,7 +3448,7 @@ store._ddl['txout_approx'],
                 # XXX Race condition in low isolation levels.
                 tx_id = store.tx_find_id_and_value(tx, False)
                 if tx_id is None:
-                    tx_id = store.import_tx(tx, False)
+                    tx_id = store.import_tx(tx, False, chain)
                     store.log.info("mempool tx %d", tx_id)
                     store.imported_bytes(tx['size'])
 
@@ -2916,7 +3491,7 @@ store._ddl['txout_approx'],
 
             try:
                 blkfile['stream'].map_file(file, 0)
-            except:
+            except Exception:
                 # mmap can fail on an empty file, but empty files are okay.
                 file.seek(0, os.SEEK_END)
                 if file.tell() == 0:
@@ -2948,7 +3523,7 @@ store._ddl['txout_approx'],
 
             try:
                 store.import_blkdat(dircfg, ds, blkfile['name'])
-            except:
+            except Exception:
                 store.log.warning("Exception at %d" % ds.read_cursor)
                 try_close_file(ds)
                 raise
@@ -3072,11 +3647,11 @@ store._ddl['txout_approx'],
                 b = chain.ds_parse_block(ds)
                 b["hash"] = hash
 
-                if (store.log.isEnabledFor(logging.DEBUG) and b["hashPrev"] == GENESIS_HASH_PREV):
+                if (store.log.isEnabledFor(logging.DEBUG) and b["hashPrev"] == chain.genesis_hash_prev):
                     try:
                         store.log.debug("Chain %d genesis tx: %s", chain.id,
                                         b['transactions'][0]['__data__'].encode('hex'))
-                    except:
+                    except Exception:
                         pass
 
                 store.import_block(b, chain = chain)
